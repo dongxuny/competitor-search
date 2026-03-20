@@ -97,21 +97,7 @@ SERPER_BASE_URL=https://google.serper.dev
 Official-site discovery fallback order is now:
 
 - `serper`
-- `Playwright + Bing`
 - `domain guess`
-
-Optional browser settings:
-
-```bash
-OFFICIAL_SITE_BROWSER_ENGINE=bing
-BROWSER_SEARCH_TIMEOUT_MS=8000
-```
-
-If you use the Playwright fallback on a fresh machine, make sure the Chromium runtime is available:
-
-```bash
-npx playwright install chromium
-```
 
 ### SearXNG
 

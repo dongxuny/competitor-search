@@ -1,5 +1,4 @@
 ARG BUILD_NODE_IMAGE=node:20
-ARG PLAYWRIGHT_RUNTIME_IMAGE=mcr.microsoft.com/playwright:v1.50.0-noble
 
 FROM --platform=$BUILDPLATFORM ${BUILD_NODE_IMAGE} AS build
 ARG BUILDPLATFORM
@@ -12,7 +11,7 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM --platform=$TARGETPLATFORM ${PLAYWRIGHT_RUNTIME_IMAGE} AS runtime
+FROM ${BUILD_NODE_IMAGE} AS runtime
 ARG TARGETPLATFORM
 WORKDIR /app
 

@@ -22,7 +22,6 @@ const MAX_PAGES_PER_SITE = 5;
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 5000);
 const PAGE_FETCH_TIMEOUT_MS = Number(process.env.PAGE_FETCH_TIMEOUT_MS || 5000);
 const METADATA_FETCH_TIMEOUT_MS = Number(process.env.METADATA_FETCH_TIMEOUT_MS || 3500);
-const BROWSER_SEARCH_TIMEOUT_MS = Number(process.env.BROWSER_SEARCH_TIMEOUT_MS || 8000);
 const tavilyApiKey = process.env.TAVILY_API_KEY || '';
 const bochaApiKey = process.env.BOCHA_API_KEY || '';
 const serperApiKey = process.env.SERPER_API_KEY || '';
@@ -30,7 +29,6 @@ const searchProvider = (process.env.SEARCH_PROVIDER || '').toLowerCase();
 const searxngBaseUrl = process.env.SEARXNG_BASE_URL || '';
 const bochaBaseUrl = process.env.BOCHA_BASE_URL || 'https://api.bocha.cn';
 const serperBaseUrl = process.env.SERPER_BASE_URL || 'https://google.serper.dev';
-const officialSiteBrowserEngine = (process.env.OFFICIAL_SITE_BROWSER_ENGINE || 'bing').toLowerCase();
 const feishuAppId = process.env.FEISHU_APP_ID || '';
 const feishuAppSecret = process.env.FEISHU_APP_SECRET || '';
 const feishuBitableAppToken = process.env.FEISHU_BITABLE_APP_TOKEN || '';
@@ -2375,92 +2373,6 @@ async function collectSerperOfficialSiteCandidates(queries, lang) {
   return candidates;
 }
 
-async function collectBrowserOfficialSiteCandidates(queries, lang) {
-  let chromium;
-
-  try {
-    ({ chromium } = await import('playwright'));
-  } catch (error) {
-    console.error(
-      '[site-discovery:browser] playwright unavailable',
-      JSON.stringify({ message: error instanceof Error ? error.message : String(error) }),
-    );
-    return [];
-  }
-
-  if (officialSiteBrowserEngine !== 'bing') {
-    return [];
-  }
-
-  let browser;
-
-  try {
-    browser = await chromium.launch({ headless: true });
-  } catch (error) {
-    console.error(
-      '[site-discovery:browser] launch failed',
-      JSON.stringify({ message: error instanceof Error ? error.message : String(error) }),
-    );
-    return [];
-  }
-
-  const candidates = [];
-  const seen = new Set();
-
-  try {
-    const page = await browser.newPage();
-
-    for (const query of queries) {
-      const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=${lang === 'zh' ? 'zh-Hans' : 'en-US'}`;
-
-      try {
-        await page.goto(searchUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: BROWSER_SEARCH_TIMEOUT_MS,
-        });
-        await page.waitForSelector('li.b_algo h2 a', { timeout: 2500 }).catch(() => {});
-      } catch (error) {
-        console.error(
-          '[site-discovery:browser] navigation failed',
-          JSON.stringify({
-            query,
-            message: error instanceof Error ? error.message : String(error),
-          }),
-        );
-        continue;
-      }
-
-      const rows = await page.$$eval('li.b_algo', (items) => items.slice(0, 8).map((item, index) => {
-        const anchor = item.querySelector('h2 a');
-        const snippet = item.querySelector('.b_caption p, .b_snippet, p');
-        return {
-          title: anchor?.textContent?.trim() || '',
-          url: anchor?.getAttribute('href') || '',
-          content: snippet?.textContent?.trim() || '',
-          score: Math.max(0, 100 - (index * 5)),
-        };
-      }));
-
-      for (const row of rows) {
-        const candidate = {
-          query,
-          title: asString(row.title, ''),
-          url: asString(row.url, ''),
-          content: asString(row.content, '').slice(0, 900),
-          score: typeof row.score === 'number' ? row.score : 0,
-        };
-        if (!candidate.url || seen.has(candidate.url)) continue;
-        seen.add(candidate.url);
-        candidates.push(candidate);
-      }
-    }
-  } finally {
-    await browser.close();
-  }
-
-  return candidates;
-}
-
 function buildDomainGuessUrls(targetName) {
   const normalized = normalizeSearchText(targetName)
     .toLowerCase()
@@ -2599,24 +2511,6 @@ async function discoverOfficialSite(input, routeDecision) {
         score: item.score || 0,
       })),
       selectedUrl: serperSelectedUrl,
-    };
-  }
-
-  const browserCandidates = await collectBrowserOfficialSiteCandidates(queries, input.lang);
-  const rankedBrowser = rankOfficialSiteCandidates(browserCandidates, targetName);
-  const browserSelectedUrl = pickOfficialSiteUrl(rankedBrowser);
-
-  if (browserSelectedUrl) {
-    return {
-      provider: `browser:${officialSiteBrowserEngine}`,
-      queries,
-      candidates: rankedBrowser.map((item) => ({
-        title: item.title,
-        url: item.url,
-        content: item.content,
-        score: item.score || 0,
-      })),
-      selectedUrl: browserSelectedUrl,
     };
   }
 
