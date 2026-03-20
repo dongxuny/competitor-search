@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AI Competitor Analyzer favicon">
+  <rect width="64" height="64" rx="18" fill="#f7f5ef"/>
+  <path d="M18 17h20c9.389 0 17 7.611 17 17s-7.611 17-17 17H18z" fill="#111111"/>
+  <path d="M24 24h14c5.523 0 10 4.477 10 10s-4.477 10-10 10H24z" fill="#f7f5ef"/>
+  <path d="M28 29h9c2.761 0 5 2.239 5 5s-2.239 5-5 5h-9z" fill="#111111"/>
+  <path d="M41.5 41.5 50 50" fill="none" stroke="#111111" stroke-linecap="round" stroke-width="5"/>
+</svg>
