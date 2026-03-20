@@ -5,6 +5,11 @@ interface StartAnalyzeResponse {
   jobId: string;
 }
 
+interface AnalyzeIntentResponse {
+  intent: string;
+  expiresInMs: number;
+}
+
 const inFlightAnalyzeStarts = new Map<string, Promise<string>>();
 
 function getErrorMessage(data: unknown, fallback: string) {
@@ -13,8 +18,37 @@ function getErrorMessage(data: unknown, fallback: string) {
     : fallback;
 }
 
-export async function startAnalyzeQuery(query: string, lang: AppLanguage): Promise<string> {
-  const key = `${lang}::${query.trim().toLowerCase()}`;
+export async function requestAnalyzeIntent(query: string, lang: AppLanguage): Promise<string> {
+  const response = await fetch('/api/analyze/intent', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, lang }),
+  });
+
+  let data: unknown;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error('The analysis intent service returned an invalid response.');
+  }
+
+  if (!response.ok) {
+    throw new Error(getErrorMessage(data, 'The analysis could not be prepared.'));
+  }
+
+  return (data as AnalyzeIntentResponse).intent;
+}
+
+export async function startAnalyzeQuery(
+  query: string,
+  lang: AppLanguage,
+  intent: string,
+  force = false,
+): Promise<string> {
+  const key = `${lang}::${query.trim().toLowerCase()}::${intent}::${force ? 'force' : 'normal'}`;
   const existing = inFlightAnalyzeStarts.get(key);
   if (existing) {
     return existing;
@@ -26,7 +60,7 @@ export async function startAnalyzeQuery(query: string, lang: AppLanguage): Promi
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ query, lang }),
+      body: JSON.stringify({ query, lang, intent, force }),
     });
 
     let data: unknown;

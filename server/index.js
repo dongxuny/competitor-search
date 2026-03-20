@@ -22,6 +22,10 @@ const MAX_PAGES_PER_SITE = 5;
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 5000);
 const PAGE_FETCH_TIMEOUT_MS = Number(process.env.PAGE_FETCH_TIMEOUT_MS || 5000);
 const METADATA_FETCH_TIMEOUT_MS = Number(process.env.METADATA_FETCH_TIMEOUT_MS || 3500);
+const ANALYSIS_CACHE_TTL_MS = Math.max(60_000, Number(process.env.ANALYSIS_CACHE_TTL_MS || 21_600_000));
+const ANALYZE_RATE_LIMIT_WINDOW_MS = Math.max(10_000, Number(process.env.ANALYZE_RATE_LIMIT_WINDOW_MS || 60_000));
+const ANALYZE_RATE_LIMIT_MAX = Math.max(1, Number(process.env.ANALYZE_RATE_LIMIT_MAX || 6));
+const ANALYZE_INTENT_TTL_MS = Math.max(30_000, Number(process.env.ANALYZE_INTENT_TTL_MS || 120_000));
 const tavilyApiKey = process.env.TAVILY_API_KEY || '';
 const bochaApiKey = process.env.BOCHA_API_KEY || '';
 const serperApiKey = process.env.SERPER_API_KEY || '';
@@ -34,6 +38,10 @@ const feishuAppSecret = process.env.FEISHU_APP_SECRET || '';
 const feishuBitableAppToken = process.env.FEISHU_BITABLE_APP_TOKEN || '';
 const feishuBitableTableId = process.env.FEISHU_BITABLE_TABLE_ID || '';
 const jobs = new Map();
+const analysisCache = new Map();
+const inFlightJobsByKey = new Map();
+const analyzeRateLimitBuckets = new Map();
+const analyzeIntents = new Map();
 let feishuTenantAccessToken = '';
 let feishuTenantAccessTokenExpiresAt = 0;
 
@@ -556,6 +564,107 @@ function normalizeInput(body) {
   };
 }
 
+function createAnalysisCacheKey(input) {
+  return `${input.lang}::${normalizeSearchText(input.query).toLowerCase()}`;
+}
+
+function getClientIdentifier(req) {
+  const forwardedFor = asString(req.headers['x-forwarded-for'], '').split(',')[0]?.trim();
+  return forwardedFor || req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function getClientFingerprint(req) {
+  return `${getClientIdentifier(req)}::${asString(req.headers['user-agent'], '').slice(0, 240)}`;
+}
+
+function cleanupAnalyzeRateLimitBuckets() {
+  const now = Date.now();
+  for (const [key, bucket] of analyzeRateLimitBuckets.entries()) {
+    if (!bucket || bucket.resetAt <= now) {
+      analyzeRateLimitBuckets.delete(key);
+    }
+  }
+}
+
+function cleanupAnalyzeIntents() {
+  const now = Date.now();
+  for (const [token, intent] of analyzeIntents.entries()) {
+    if (!intent || intent.expiresAt <= now || intent.usedAt) {
+      analyzeIntents.delete(token);
+    }
+  }
+}
+
+function checkAnalyzeRateLimit(req) {
+  cleanupAnalyzeRateLimitBuckets();
+  const now = Date.now();
+  const clientId = getClientIdentifier(req);
+  const bucket = analyzeRateLimitBuckets.get(clientId);
+
+  if (!bucket || bucket.resetAt <= now) {
+    analyzeRateLimitBuckets.set(clientId, {
+      count: 1,
+      resetAt: now + ANALYZE_RATE_LIMIT_WINDOW_MS,
+    });
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+
+  if (bucket.count >= ANALYZE_RATE_LIMIT_MAX) {
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)),
+    };
+  }
+
+  bucket.count += 1;
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+
+function getCachedAnalysisResult(cacheKey) {
+  const entry = analysisCache.get(cacheKey);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    analysisCache.delete(cacheKey);
+    return null;
+  }
+  return entry.result;
+}
+
+function setCachedAnalysisResult(cacheKey, result) {
+  analysisCache.set(cacheKey, {
+    result,
+    expiresAt: Date.now() + ANALYSIS_CACHE_TTL_MS,
+  });
+}
+
+function createAnalyzeIntent(req, input) {
+  cleanupAnalyzeIntents();
+  const token = randomUUID();
+  analyzeIntents.set(token, {
+    query: input.query,
+    lang: input.lang,
+    fingerprint: getClientFingerprint(req),
+    expiresAt: Date.now() + ANALYZE_INTENT_TTL_MS,
+    usedAt: 0,
+  });
+  return token;
+}
+
+function consumeAnalyzeIntent(req, input, token) {
+  cleanupAnalyzeIntents();
+  const intent = analyzeIntents.get(token);
+  if (!intent) return false;
+  if (intent.usedAt) return false;
+  if (intent.expiresAt <= Date.now()) {
+    analyzeIntents.delete(token);
+    return false;
+  }
+  if (intent.query !== input.query || intent.lang !== input.lang) return false;
+  if (intent.fingerprint !== getClientFingerprint(req)) return false;
+  intent.usedAt = Date.now();
+  return true;
+}
+
 function buildInitialSteps(lang) {
   return [
     {
@@ -582,7 +691,7 @@ function buildInitialSteps(lang) {
   ];
 }
 
-function createJob(input) {
+function createJob(input, overrides = {}) {
   const jobId = randomUUID();
   const job = {
     id: jobId,
@@ -593,6 +702,7 @@ function createJob(input) {
     steps: buildInitialSteps(input.lang),
     logs: [],
     createdAt: Date.now(),
+    ...overrides,
   };
 
   jobs.set(jobId, job);
@@ -630,6 +740,21 @@ function completeJob(job, result) {
     logs: job.logs,
   };
   job.partialResult = job.result;
+}
+
+function createCompletedJob(input, result) {
+  return createJob(input, {
+    status: 'completed',
+    result,
+    partialResult: result,
+    logs: Array.isArray(result?.logs) ? result.logs : [],
+    steps: buildInitialSteps(input.lang).map((step) => ({
+      ...step,
+      status: 'completed',
+      startedAt: Date.now(),
+      completedAt: Date.now(),
+    })),
+  });
 }
 
 function failJob(job, errorMessage) {
@@ -2491,10 +2616,10 @@ async function gatherSearchEvidence(input, brief, metadata) {
 
 async function discoverOfficialSite(input, routeDecision) {
   const targetName = routeDecision.targetNameGuess || input.query;
-  const queries = [
-    `${targetName} 官网`,
-    `${targetName} official site`,
-  ].map((query) => normalizeSearchText(query)).filter(Boolean);
+  const primaryQuery = input.lang === 'zh'
+    ? `${targetName} 官网`
+    : `${targetName} official site`;
+  const queries = [primaryQuery].map((query) => normalizeSearchText(query)).filter(Boolean);
 
   const serperCandidates = await collectSerperOfficialSiteCandidates(queries, input.lang);
   const rankedSerper = rankOfficialSiteCandidates(serperCandidates, targetName);
@@ -3242,6 +3367,9 @@ app.get('/api/health', (_req, res) => {
 app.post('/api/analyze/start', async (req, res) => {
   const normalized = normalizeInput(req.body);
   const input = parseQuery(normalized.query, normalized.lang);
+  const cacheKey = createAnalysisCacheKey(input);
+  const intentToken = asString(req.body?.intent, '');
+  const force = Boolean(req.body?.force);
 
   if (!input.query) {
     res.status(400).json({ error: 'Please provide a product URL or a product description.' });
@@ -3253,7 +3381,41 @@ app.post('/api/analyze/start', async (req, res) => {
     return;
   }
 
+  if (!intentToken || !consumeAnalyzeIntent(req, input, intentToken)) {
+    res.status(403).json({
+      error: input.lang === 'zh'
+        ? '当前分析链接无效或已过期，请从首页重新发起分析。'
+        : 'This analysis link is invalid or expired. Please start again from the homepage.',
+    });
+    return;
+  }
+
+  const cachedResult = force ? null : getCachedAnalysisResult(cacheKey);
+  if (cachedResult) {
+    const cachedJob = createCompletedJob(input, cachedResult);
+    res.json({ jobId: cachedJob.id });
+    return;
+  }
+
+  const existingJobId = inFlightJobsByKey.get(cacheKey);
+  if (existingJobId && jobs.has(existingJobId)) {
+    res.json({ jobId: existingJobId });
+    return;
+  }
+
+  const rateLimit = checkAnalyzeRateLimit(req);
+  if (!rateLimit.allowed) {
+    res.set('Retry-After', String(rateLimit.retryAfterSeconds));
+    res.status(429).json({
+      error: input.lang === 'zh'
+        ? `请求过于频繁，请在 ${rateLimit.retryAfterSeconds} 秒后重试。`
+        : `Too many analysis requests. Try again in ${rateLimit.retryAfterSeconds} seconds.`,
+    });
+    return;
+  }
+
   const job = createJob(input);
+  inFlightJobsByKey.set(cacheKey, job.id);
 
   void (async () => {
     try {
@@ -3281,11 +3443,13 @@ app.post('/api/analyze/start', async (req, res) => {
           appendJobLog(job, input.lang === 'zh' ? '分析已完成。' : 'Analysis completed.');
           updateJobStep(job, STEP_IDS.analyze, 'completed');
           completeJob(job, finalResult);
+          setCachedAnalysisResult(cacheKey, job.result);
         },
       });
 
       if (job.status !== 'completed') {
         completeJob(job, result);
+        setCachedAnalysisResult(cacheKey, job.result);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown analysis error.';
@@ -3294,6 +3458,10 @@ app.post('/api/analyze/start', async (req, res) => {
       updateJobStep(job, STEP_IDS.search, job.steps[1].status === 'running' ? 'failed' : job.steps[1].status);
       updateJobStep(job, STEP_IDS.analyze, job.steps[2].status === 'running' ? 'failed' : job.steps[2].status);
       failJob(job, client ? `Live analysis failed: ${message}` : message);
+    } finally {
+      if (inFlightJobsByKey.get(cacheKey) === job.id) {
+        inFlightJobsByKey.delete(cacheKey);
+      }
     }
   })();
 
@@ -3321,7 +3489,7 @@ app.get('/api/analyze/:jobId', (req, res) => {
   });
 });
 
-app.post('/api/analyze', async (req, res) => {
+app.post('/api/analyze/intent', (req, res) => {
   const normalized = normalizeInput(req.body);
   const input = parseQuery(normalized.query, normalized.lang);
 
@@ -3335,9 +3503,60 @@ app.post('/api/analyze', async (req, res) => {
     return;
   }
 
+  const token = createAnalyzeIntent(req, input);
+  res.json({
+    intent: token,
+    expiresInMs: ANALYZE_INTENT_TTL_MS,
+  });
+});
+
+app.post('/api/analyze', async (req, res) => {
+  const normalized = normalizeInput(req.body);
+  const input = parseQuery(normalized.query, normalized.lang);
+  const cacheKey = createAnalysisCacheKey(input);
+  const intentToken = asString(req.body?.intent, '');
+  const force = Boolean(req.body?.force);
+
+  if (!input.query) {
+    res.status(400).json({ error: 'Please provide a product URL or a product description.' });
+    return;
+  }
+
+  if (shouldTriggerDemoError(input.query)) {
+    res.status(400).json({ error: 'The analysis could not be generated for this input. Try a different product URL or description.' });
+    return;
+  }
+
+  if (!intentToken || !consumeAnalyzeIntent(req, input, intentToken)) {
+    res.status(403).json({
+      error: input.lang === 'zh'
+        ? '当前分析链接无效或已过期，请从首页重新发起分析。'
+        : 'This analysis link is invalid or expired. Please start again from the homepage.',
+    });
+    return;
+  }
+
+  const cachedResult = force ? null : getCachedAnalysisResult(cacheKey);
+  if (cachedResult) {
+    res.json({ result: cachedResult });
+    return;
+  }
+
+  const rateLimit = checkAnalyzeRateLimit(req);
+  if (!rateLimit.allowed) {
+    res.set('Retry-After', String(rateLimit.retryAfterSeconds));
+    res.status(429).json({
+      error: input.lang === 'zh'
+        ? `请求过于频繁，请在 ${rateLimit.retryAfterSeconds} 秒后重试。`
+        : `Too many analysis requests. Try again in ${rateLimit.retryAfterSeconds} seconds.`,
+    });
+    return;
+  }
+
   try {
     const metadata = await fetchUrlMetadata(input.url);
     const result = await runAnalysis(input, metadata);
+    setCachedAnalysisResult(cacheKey, result);
     res.json({ result });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown analysis error.';

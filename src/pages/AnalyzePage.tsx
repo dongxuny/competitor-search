@@ -7,7 +7,7 @@ import { ProgressSteps } from '../components/analyze/ProgressSteps';
 import { SearchEvidenceSection } from '../components/analyze/SearchEvidenceSection';
 import { TargetProductSection } from '../components/analyze/TargetProductSection';
 import { ComparisonTable } from '../components/ComparisonTable';
-import { getAnalyzeJob, startAnalyzeQuery, submitFeedback } from '../lib/api';
+import { getAnalyzeJob, requestAnalyzeIntent, startAnalyzeQuery, submitFeedback } from '../lib/api';
 import { useLanguage } from '../hooks/useLanguage';
 import { t } from '../i18n';
 import type { AnalysisResult, AnalysisStep } from '../types';
@@ -17,6 +17,10 @@ type DebugStep = 'understand' | 'analyze' | 'logs' | null;
 
 function getAnalysisCacheKey(query: string, lang: 'en' | 'zh') {
   return `analysis-cache::${lang}::${query.trim().toLowerCase()}`;
+}
+
+function getAnalysisJobCacheKey(query: string, lang: 'en' | 'zh') {
+  return `analysis-job::${lang}::${query.trim().toLowerCase()}`;
 }
 
 export function AnalyzePage() {
@@ -37,20 +41,31 @@ export function AnalyzePage() {
   const [showContactModal, setShowContactModal] = useState(false);
 
   const query = searchParams.get('q')?.trim() ?? '';
+  const intent = searchParams.get('intent')?.trim() ?? '';
+  const force = searchParams.get('force') === '1';
 
-  function buildAnalyzeUrl(nextQuery: string) {
+  async function navigateWithIntent(nextQuery: string, nextLang: 'en' | 'zh', nextForce = false) {
+    const nextIntent = await requestAnalyzeIntent(nextQuery, nextLang);
     const params = new URLSearchParams({
       q: nextQuery,
-      lang,
+      lang: nextLang,
+      intent: nextIntent,
       t: String(Date.now()),
     });
-    return `/analyze?${params.toString()}`;
+    if (nextForce) {
+      params.set('force', '1');
+    }
+    navigate(`/analyze?${params.toString()}`);
   }
 
-  function handleLanguageChange(nextLang: 'en' | 'zh') {
+  async function handleLanguageChange(nextLang: 'en' | 'zh') {
     setLang(nextLang);
     if (query) {
-      navigate(`/analyze?q=${encodeURIComponent(query)}&lang=${nextLang}`);
+      try {
+        await navigateWithIntent(query, nextLang);
+      } catch {
+        navigate(`/?q=${encodeURIComponent(query)}&lang=${nextLang}`);
+      }
       return;
     }
     navigate(`/analyze?lang=${nextLang}`);
@@ -118,32 +133,49 @@ export function AnalyzePage() {
     }
 
     const cacheKey = getAnalysisCacheKey(query, lang);
-    try {
-      const raw = window.sessionStorage.getItem(cacheKey);
-      if (raw) {
-        const cached = JSON.parse(raw) as AnalysisResult;
-        setResult(cached);
-        setPartialResult(cached);
-        setSteps([
-          { id: 'understand', label: lang === 'zh' ? '分析需求' : 'Understand input', status: 'completed' },
-          { id: 'search', label: lang === 'zh' ? '搜索外部证据' : 'Search evidence', status: 'completed' },
-          { id: 'analyze', label: lang === 'zh' ? '生成竞品分析' : 'Generate analysis', status: 'completed' },
-        ]);
-        setLogs(cached.logs || []);
-        setViewState('success');
-        setError(null);
-        setDebugStep(null);
-        setFeedbackRating(null);
-        setFeedbackComment('');
-        setFeedbackState('idle');
-        setShowFeedbackModal(false);
-        setShowContactModal(false);
-        return () => {
-          isActive = false;
-        };
+    const jobCacheKey = getAnalysisJobCacheKey(query, lang);
+    if (!force) {
+      try {
+        const raw = window.sessionStorage.getItem(cacheKey);
+        if (raw) {
+          const cached = JSON.parse(raw) as AnalysisResult;
+          setResult(cached);
+          setPartialResult(cached);
+          setSteps([
+            { id: 'understand', label: lang === 'zh' ? '分析需求' : 'Understand input', status: 'completed' },
+            { id: 'search', label: lang === 'zh' ? '搜索外部证据' : 'Search evidence', status: 'completed' },
+            { id: 'analyze', label: lang === 'zh' ? '生成竞品分析' : 'Generate analysis', status: 'completed' },
+          ]);
+          setLogs(cached.logs || []);
+          setViewState('success');
+          setError(null);
+          setDebugStep(null);
+          setFeedbackRating(null);
+          setFeedbackComment('');
+          setFeedbackState('idle');
+          setShowFeedbackModal(false);
+          setShowContactModal(false);
+          return () => {
+            isActive = false;
+          };
+        }
+      } catch {
+        // Ignore invalid cache and continue with live analysis.
       }
+    }
+
+    let existingJobId = '';
+    try {
+      existingJobId = window.sessionStorage.getItem(jobCacheKey) || '';
     } catch {
-      // Ignore invalid cache and continue with live analysis.
+      existingJobId = '';
+    }
+
+    if (!intent && !existingJobId) {
+      navigate(`/?q=${encodeURIComponent(query)}&lang=${lang}`, { replace: true });
+      return () => {
+        isActive = false;
+      };
     }
 
     setViewState('loading');
@@ -161,8 +193,18 @@ export function AnalyzePage() {
 
     let pollTimeout: number | undefined;
 
-    startAnalyzeQuery(query, lang)
+    const startPromise = existingJobId
+      ? Promise.resolve(existingJobId)
+      : startAnalyzeQuery(query, lang, intent, force);
+
+    startPromise
       .then(async (jobId) => {
+        try {
+          window.sessionStorage.setItem(jobCacheKey, jobId);
+        } catch {
+          // Ignore session storage failures.
+        }
+
         async function poll() {
           const job = await getAnalyzeJob(jobId);
           if (!isActive) return;
@@ -175,15 +217,24 @@ export function AnalyzePage() {
             setResult(job.result);
             try {
               window.sessionStorage.setItem(cacheKey, JSON.stringify(job.result));
+              window.sessionStorage.removeItem(jobCacheKey);
             } catch {
               // Ignore session storage failures.
             }
             setViewState('success');
             setLogs(job.result.logs || job.logs || []);
+            if (intent || force) {
+              navigate(`/analyze?q=${encodeURIComponent(query)}&lang=${lang}`, { replace: true });
+            }
             return;
           }
 
           if (job.status === 'failed') {
+            try {
+              window.sessionStorage.removeItem(jobCacheKey);
+            } catch {
+              // Ignore session storage failures.
+            }
             setError(job.error || 'The analysis could not be generated for this input.');
             setViewState('error');
             return;
@@ -198,10 +249,22 @@ export function AnalyzePage() {
       })
       .catch((analysisError) => {
         if (!isActive) return;
+        try {
+          window.sessionStorage.removeItem(jobCacheKey);
+        } catch {
+          // Ignore session storage failures.
+        }
         const message =
           analysisError instanceof Error
             ? analysisError.message
             : 'The analysis could not be generated for this input.';
+        if (
+          analysisError instanceof Error &&
+          /invalid or expired|重新发起分析|homepage/i.test(analysisError.message)
+        ) {
+          navigate(`/?q=${encodeURIComponent(query)}&lang=${lang}`, { replace: true });
+          return;
+        }
         setError(message);
         setViewState('error');
       });
@@ -212,7 +275,7 @@ export function AnalyzePage() {
         window.clearTimeout(pollTimeout);
       }
     };
-  }, [query, lang]);
+  }, [query, lang, intent, force, navigate]);
 
   if (viewState === 'empty') {
     return (
@@ -385,9 +448,15 @@ export function AnalyzePage() {
                   {lang === 'zh' ? '查看调试信息' : 'View debug'}
                 </button>
               ) : null}
-              <button
-                type="button"
-                onClick={() => navigate(buildAnalyzeUrl(query))}
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigateWithIntent(query, lang, true);
+                    } catch (error) {
+                      setError(error instanceof Error ? error.message : 'The analysis could not be started.');
+                    }
+                  }}
                 className="inline-flex h-10 items-center justify-center rounded-full bg-black px-5 text-sm font-medium text-white"
               >
                 {t(lang, 'tryAgain')}
@@ -490,10 +559,23 @@ export function AnalyzePage() {
               </button>
               <button
                 type="button"
+                onClick={async () => {
+                  try {
+                    await navigateWithIntent(query, lang, true);
+                  } catch (error) {
+                    setError(error instanceof Error ? error.message : 'The analysis could not be started.');
+                  }
+                }}
+                className="inline-flex h-10 items-center justify-center rounded-full border border-[#c9d9f8] bg-[#edf4ff] px-5 text-sm font-medium text-[#1849a9] transition hover:bg-[#e4efff]"
+              >
+                {t(lang, 'rerunAnalysis')}
+              </button>
+              <button
+                type="button"
                 onClick={() => navigate(`/?lang=${lang}`)}
                 className="inline-flex h-10 items-center justify-center rounded-full bg-black px-5 text-sm font-medium text-white"
               >
-                {t(lang, 'newAnalysis')}
+                {t(lang, 'backToHomepage')}
               </button>
             </div>
           </div>

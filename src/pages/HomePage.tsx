@@ -4,18 +4,15 @@ import { InputForm } from '../components/InputForm';
 import { LanguageToggle } from '../components/LanguageToggle';
 import { useLanguage } from '../hooks/useLanguage';
 import { t } from '../i18n';
-import { submitFeedback } from '../lib/api';
+import { requestAnalyzeIntent, submitFeedback } from '../lib/api';
 import type { ProductInput } from '../types';
-
-const initialInput: ProductInput = {
-  query: '',
-};
 
 export function HomePage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { lang, setLang } = useLanguage(searchParams.get('lang'));
-  const [input, setInput] = useState<ProductInput>(initialInput);
+  const prefilledQuery = searchParams.get('q')?.trim() ?? '';
+  const [input, setInput] = useState<ProductInput>({ query: prefilledQuery });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showFeedbackModal, setShowFeedbackModal] = useState(false);
@@ -34,7 +31,15 @@ export function HomePage() {
     setIsSubmitting(true);
 
     try {
-      navigate(`/analyze?q=${encodeURIComponent(input.query.trim())}&lang=${lang}`);
+      const nextQuery = input.query.trim();
+      const intent = await requestAnalyzeIntent(nextQuery, lang);
+      navigate(`/analyze?q=${encodeURIComponent(nextQuery)}&lang=${lang}&intent=${encodeURIComponent(intent)}`);
+    } catch (submitError) {
+      setError(
+        submitError instanceof Error
+          ? submitError.message
+          : 'The analysis could not be started.',
+      );
     } finally {
       setIsSubmitting(false);
     }
