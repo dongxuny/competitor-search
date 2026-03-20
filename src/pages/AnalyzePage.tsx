@@ -277,10 +277,14 @@ export function AnalyzePage() {
             />
             {logs.length ? (
               <section className="rounded-[1.25rem] border border-black/8 bg-white p-5">
-                <div className="mb-3">
+                <div className="mb-3 flex items-center justify-between gap-4">
                   <p className="text-xs font-medium uppercase tracking-[0.12em] text-black/40">
                     {lang === 'zh' ? '运行日志' : 'Live logs'}
                   </p>
+                  <div className="inline-flex items-center gap-2 rounded-full border border-[#d8e8de] bg-[#f3f8f4] px-3 py-1.5 text-[11px] font-medium text-[#244233]">
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-[#2d7a54]" />
+                    <span>{lang === 'zh' ? '正在执行分析中' : 'Analysis in progress'}</span>
+                  </div>
                 </div>
                 <div className="max-h-[220px] overflow-auto rounded-[1rem] border border-black/8 bg-[#fcfcfc] p-4 font-mono text-[12px] leading-6 text-black/72">
                   {logs.map((line, index) => (

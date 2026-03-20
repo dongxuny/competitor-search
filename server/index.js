@@ -3226,8 +3226,8 @@ async function runAnalysis(input, metadata, hooks = {}) {
       }
       if (officialSiteDiscovery?.selectedUrl) {
         onLog?.(input.lang === 'zh'
-          ? `已找到官网：${officialSiteDiscovery.selectedUrl}（来源：${officialSiteDiscovery.provider || 'unknown'}）`
-          : `Official site selected: ${officialSiteDiscovery.selectedUrl} (source: ${officialSiteDiscovery.provider || 'unknown'})`);
+          ? `已找到官网：${officialSiteDiscovery.selectedUrl}`
+          : `Official site selected: ${officialSiteDiscovery.selectedUrl}`);
         workingInput = {
           ...input,
           url: officialSiteDiscovery.selectedUrl,

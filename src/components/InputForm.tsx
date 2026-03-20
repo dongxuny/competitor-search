@@ -72,10 +72,14 @@ export function InputForm({ lang, value, error, isSubmitting, onChange, onSubmit
           ) : null}
         </div>
 
+        <div className="mb-3 rounded-[1rem] border border-[#d8e8de] bg-[#f3f8f4] px-4 py-3 text-sm leading-6 text-[#244233]">
+          {t(lang, 'officialSiteTip')}
+        </div>
+
         <label className="block">
           <textarea
             rows={4}
-            placeholder="https://example.com or A product that helps SaaS teams track competitor pricing and positioning."
+            placeholder={t(lang, 'inputPlaceholder')}
             value={value.query}
             onChange={(event) => onChange({ query: event.target.value })}
             onKeyDown={handleKeyDown}
